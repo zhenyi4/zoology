@@ -12,7 +12,7 @@ import triton.language as tl
 
 from einops import rearrange, repeat
 
-from mamba_ssm.ops.triton.softplus import softplus
+from zoology.mixers.mamba_ssm.ops.triton.softplus import softplus
 
 
 def init_to_zero(names):

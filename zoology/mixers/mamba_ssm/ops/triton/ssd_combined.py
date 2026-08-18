@@ -24,21 +24,21 @@ try:
 except ImportError:
     causal_conv1d_fn, causal_conv1d_cuda = None, None
 
-from mamba_ssm.ops.triton.ssd_bmm import _bmm_chunk_fwd, _bmm_chunk_bwd
-from mamba_ssm.ops.triton.ssd_chunk_state import _chunk_cumsum_fwd, _chunk_cumsum_bwd
-from mamba_ssm.ops.triton.ssd_chunk_state import _chunk_state_fwd, _chunk_state_bwd_db
-from mamba_ssm.ops.triton.ssd_chunk_state import _chunk_state_bwd_ddAcs_stable
-from mamba_ssm.ops.triton.ssd_chunk_state import chunk_state, chunk_state_ref
-from mamba_ssm.ops.triton.ssd_chunk_state import chunk_state_varlen
-from mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd, _state_passing_bwd
-from mamba_ssm.ops.triton.ssd_state_passing import state_passing, state_passing_ref
-from mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_fwd, _chunk_scan_bwd_dz, _chunk_scan_bwd_dstates
-from mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_bwd_dC, _chunk_scan_bwd_dcb
-from mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_bwd_ddAcs_stable
-from mamba_ssm.ops.triton.ssd_chunk_scan import chunk_scan, chunk_scan_ref
-from mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_bwd_ddAcs_prev
-from mamba_ssm.ops.triton.layernorm_gated import rmsnorm_fn, _layer_norm_fwd, _layer_norm_bwd
-from mamba_ssm.ops.triton.k_activations import _swiglu_fwd, _swiglu_bwd
+from zoology.mixers.mamba_ssm.ops.triton.ssd_bmm import _bmm_chunk_fwd, _bmm_chunk_bwd
+from zoology.mixers.mamba_ssm.ops.triton.ssd_chunk_state import _chunk_cumsum_fwd, _chunk_cumsum_bwd
+from zoology.mixers.mamba_ssm.ops.triton.ssd_chunk_state import _chunk_state_fwd, _chunk_state_bwd_db
+from zoology.mixers.mamba_ssm.ops.triton.ssd_chunk_state import _chunk_state_bwd_ddAcs_stable
+from zoology.mixers.mamba_ssm.ops.triton.ssd_chunk_state import chunk_state, chunk_state_ref
+from zoology.mixers.mamba_ssm.ops.triton.ssd_chunk_state import chunk_state_varlen
+from zoology.mixers.mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd, _state_passing_bwd
+from zoology.mixers.mamba_ssm.ops.triton.ssd_state_passing import state_passing, state_passing_ref
+from zoology.mixers.mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_fwd, _chunk_scan_bwd_dz, _chunk_scan_bwd_dstates
+from zoology.mixers.mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_bwd_dC, _chunk_scan_bwd_dcb
+from zoology.mixers.mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_bwd_ddAcs_stable
+from zoology.mixers.mamba_ssm.ops.triton.ssd_chunk_scan import chunk_scan, chunk_scan_ref
+from zoology.mixers.mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_bwd_ddAcs_prev
+from zoology.mixers.mamba_ssm.ops.triton.layernorm_gated import rmsnorm_fn, _layer_norm_fwd, _layer_norm_bwd
+from zoology.mixers.mamba_ssm.ops.triton.k_activations import _swiglu_fwd, _swiglu_bwd
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 
@@ -979,4 +979,3 @@ def mamba_split_conv1d_scan_ref(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, 
     if outproj_weight is not None:
         out = F.linear(out, outproj_weight, outproj_bias)
     return out
-

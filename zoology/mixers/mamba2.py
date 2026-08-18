@@ -20,10 +20,6 @@ from huggingface_hub import PyTorchModelHubMixin
 
 from zoology.mixers.mamba_ssm.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
 from zoology.mixers.mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
-try:
-    from causal_conv1d import causal_conv1d_fn
-except:
-    assert 0, print(f"Need to install causal_conv1d: pip install causal_conv1d")
 from zoology.mixers.mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 from zoology.mixers.mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
 
@@ -138,7 +134,6 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
 
     def forward(self, u, seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None):
-        
         """
         u: (batch, seqlen, hidden_dim) if seqlen=None.
             If seqlen is not None, u is (batch * seqlen, hidden_dim). This is so that when we
@@ -146,8 +141,6 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             (in case batch is small).
         Returns: same shape as u
         """
-        import torch
-        torch.autograd.set_detect_anomaly(True)
         seqlen_og = seqlen
         if seqlen is None:
             batch, seqlen, dim = u.shape
@@ -307,4 +300,3 @@ class Mamba2Block(nn.Module):
             )
         hidden_states = self.mixer(hidden_states, inference_params=inference_params, **mixer_kwargs)
         return hidden_states, residual
-
