@@ -238,6 +238,9 @@ class LMBackbone(nn.Module):
         elif config.block_type == "Mamba2Block": 
             from zoology.mixers.mamba2 import Mamba2Block
             block_cls = Mamba2Block
+        elif config.block_type == "Mamba2MLPBlock":
+            from zoology.mixers.mamba2 import Mamba2MLPBlock
+            block_cls = Mamba2MLPBlock
         self.layers = nn.ModuleList(
             [
                 block_cls(config=config, layer_idx=i)
@@ -246,7 +249,16 @@ class LMBackbone(nn.Module):
         )
         self.drop_f = nn.Dropout(config.resid_dropout)
         self.ln_f = nn.LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
-        self.apply(partial(_init_weights, n_layers=config.n_layers, block_type=config.block_type))
+        self.apply(
+            partial(
+                _init_weights,
+                n_layers=config.n_layers,
+                block_type=config.block_type,
+                n_residuals_per_layer=(
+                    2 if config.block_type == "Mamba2MLPBlock" else 1
+                ),
+            )
+        )
 
     def layers_forward(self, hidden_states):
         """Forward through layers only (skip embeddings)."""
@@ -311,7 +323,16 @@ class LanguageModel(nn.Module):
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
-        self.apply(partial(_init_weights, n_layers=config.n_layers, block_type=config.block_type))
+        self.apply(
+            partial(
+                _init_weights,
+                n_layers=config.n_layers,
+                block_type=config.block_type,
+                n_residuals_per_layer=(
+                    2 if config.block_type == "Mamba2MLPBlock" else 1
+                ),
+            )
+        )
 
         # tie weights if word embeddings are learnable
         if config.learnable_word_embeddings:

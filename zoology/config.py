@@ -110,7 +110,12 @@ class ModelConfig(BaseConfig):
     layer_norm_epsilon: float = 1e-5
     pad_vocab_size_multiple: int = 1
 
-    block_type: Literal["TransformerBlock", "MambaBlock", "Mamba2Block"] = "TransformerBlock"
+    block_type: Literal[
+        "TransformerBlock",
+        "MambaBlock",
+        "Mamba2Block",
+        "Mamba2MLPBlock",
+    ] = "TransformerBlock"
     name: str = "default"
 
 class LoggerConfig(BaseConfig):

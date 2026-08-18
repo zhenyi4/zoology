@@ -300,3 +300,72 @@ class Mamba2Block(nn.Module):
             )
         hidden_states = self.mixer(hidden_states, inference_params=inference_params, **mixer_kwargs)
         return hidden_states, residual
+
+
+class Mamba2MLPBlock(Mamba2Block):
+    """Mamba2 block followed by a separately normalized MLP residual branch.
+
+    This preserves ``Mamba2Block``'s add-then-RMSNorm mixer path and appends a
+    second add-then-RMSNorm sublayer for ``config.state_mixer``. It is useful
+    for controlled comparisons against the mixer-only Mamba2 block without
+    switching to Zoology's LayerNorm-based ``TransformerBlock``.
+    """
+
+    def __init__(
+        self,
+        config,
+        norm_cls=RMSNorm,
+        fused_add_norm=False,
+        residual_in_fp32=False,
+        use_fast_path=True,
+        **kwargs,
+    ):
+        super().__init__(
+            config=config,
+            norm_cls=norm_cls,
+            fused_add_norm=fused_add_norm,
+            residual_in_fp32=residual_in_fp32,
+            use_fast_path=use_fast_path,
+            **kwargs,
+        )
+        self.norm2 = norm_cls(config.d_model)
+        self.mlp = config.state_mixer.instantiate(
+            d_model=config.d_model,
+            layer_idx=kwargs.get("layer_idx"),
+        )
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        residual: Optional[Tensor] = None,
+        inference_params=None,
+        **mixer_kwargs,
+    ):
+        hidden_states, residual = super().forward(
+            hidden_states,
+            residual=residual,
+            inference_params=inference_params,
+            **mixer_kwargs,
+        )
+
+        if not self.fused_add_norm:
+            residual = hidden_states + residual
+            hidden_states = self.norm2(
+                residual.to(dtype=self.norm2.weight.dtype)
+            )
+            if self.residual_in_fp32:
+                residual = residual.to(torch.float32)
+        else:
+            hidden_states, residual = layer_norm_fn(
+                hidden_states,
+                self.norm2.weight,
+                self.norm2.bias,
+                residual=residual,
+                prenorm=True,
+                residual_in_fp32=self.residual_in_fp32,
+                eps=self.norm2.eps,
+                is_rms_norm=isinstance(self.norm2, RMSNorm),
+            )
+
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
