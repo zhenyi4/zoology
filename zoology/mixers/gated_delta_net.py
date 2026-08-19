@@ -75,6 +75,12 @@ class GatedDeltaNet(nn.Module):
             The kernel size of the short convolution, only used when `use_short_conv` is `True`. Default: 4.
         conv_bias (bool, Optional):
             Whether to use bias in the short convolution, only used when `use_short_conv` is `True`. Default: `False`.
+        forgetting_init (str, Optional):
+            Initialization for the recurrent decay parameters. ``default``
+            preserves Zoology's random GDN initialization. ``palimpsa_small``
+            uses Palimpsa's small-decay initialization: A is linearly spaced
+            from 0.01 to 0.16 and dt is log-spaced from 0.1 to 0.001 across
+            heads. Default: ``default``.
         layer_idx (int, Optional):
             The index of the layer. Default: None.
         norm_eps (float, Optional):
@@ -92,6 +98,7 @@ class GatedDeltaNet(nn.Module):
         use_short_conv: bool = True,
         conv_size: int = 4,
         conv_bias: bool = False,
+        forgetting_init: str = 'default',
         layer_idx: int = None,
         norm_eps: float = 1e-5,
         **kwargs
@@ -108,6 +115,7 @@ class GatedDeltaNet(nn.Module):
         self.use_short_conv = use_short_conv
         self.conv_size = conv_size
         self.conv_bias = conv_bias
+        self.forgetting_init = forgetting_init
 
         # self.head_dim = head_dim
         self.num_heads = num_heads
@@ -128,7 +136,16 @@ class GatedDeltaNet(nn.Module):
         self.v_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
         self.b_proj = nn.Linear(hidden_size, self.num_heads, bias=False)
         self.a_proj = nn.Linear(hidden_size, self.num_heads, bias=False)
-        A = torch.empty(self.num_heads, dtype=torch.float32).uniform_(0, 16)
+
+        if forgetting_init == 'default':
+            A = torch.empty(self.num_heads, dtype=torch.float32).uniform_(0, 16)
+        elif forgetting_init == 'palimpsa_small':
+            A = torch.linspace(0.01, 0.16, steps=self.num_heads, dtype=torch.float32)
+        else:
+            raise ValueError(
+                "forgetting_init must be 'default' or 'palimpsa_small'; "
+                f"got {forgetting_init!r}."
+            )
         A_log = torch.log(A)
         self.A_log = nn.Parameter(A_log)
         self.A_log._no_weight_decay = True
@@ -138,10 +155,17 @@ class GatedDeltaNet(nn.Module):
         dt_min = 0.001
         dt_max = 0.1
         dt_init_floor = 1e-4
-        dt = torch.exp(
-            torch.rand(self.num_heads) * (math.log(dt_max) - math.log(dt_min))
-            + math.log(dt_min)
-        )
+        if forgetting_init == 'palimpsa_small':
+            dt_ramp = torch.linspace(1.0, 0.0, steps=self.num_heads)
+            dt = torch.exp(
+                dt_ramp * (math.log(dt_max) - math.log(dt_min))
+                + math.log(dt_min)
+            )
+        else:
+            dt = torch.exp(
+                torch.rand(self.num_heads) * (math.log(dt_max) - math.log(dt_min))
+                + math.log(dt_min)
+            )
         dt = torch.clamp(dt, min=dt_init_floor)
         # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
         inv_dt = dt + torch.log(-torch.expm1(-dt))
@@ -302,4 +326,3 @@ class GatedDeltaNet(nn.Module):
             self.num_heads * self.head_k_dim * self.head_v_dim
         )
         return state_size 
-
