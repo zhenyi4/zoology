@@ -87,6 +87,12 @@ class DirectFLAGatedDeltaNet(nn.Module):
             raise ValueError(f"head_dim must be positive; got {head_dim}.")
         if expand_v <= 0:
             raise ValueError(f"expand_v must be positive; got {expand_v}.")
+        if not float(expand_v).is_integer():
+            raise ValueError(
+                "DirectFLAGatedDeltaNet requires an integer expand_v for "
+                "compatibility with the vendored FLA GDN layer; got "
+                f"{expand_v}."
+            )
         if autocast_dtype not in self._SUPPORTED_AUTOCAST_DTYPES:
             raise ValueError(
                 "autocast_dtype must be one of "
@@ -109,13 +115,11 @@ class DirectFLAGatedDeltaNet(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.expand_v = expand_v
-        self.head_v_dim = int(head_dim * expand_v)
-        if self.head_v_dim != head_dim * expand_v:
-            raise ValueError(
-                "head_dim * expand_v must be an integer because it defines "
-                f"the per-head value dimension; got {head_dim} * {expand_v}."
-            )
+        # Older FLA snapshots multiply key_dim by expand_v without converting
+        # the result to int before passing it to nn.Linear. Normalize values
+        # such as 1.0 and 2.0 here so out_features never becomes 256.0/512.0.
+        self.expand_v = int(expand_v)
+        self.head_v_dim = head_dim * self.expand_v
         self.autocast_dtype = autocast_dtype
         self.output_gate_activation = output_gate_activation
 
@@ -124,7 +128,7 @@ class DirectFLAGatedDeltaNet(nn.Module):
         # nonlinearity when a paper-aligned control explicitly requests it.
         self.fla_layer = FLAGatedDeltaNet(
             hidden_size=d_model,
-            expand_v=expand_v,
+            expand_v=self.expand_v,
             head_dim=head_dim,
             num_heads=num_heads,
             mode=mode,
