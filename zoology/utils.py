@@ -1,4 +1,5 @@
 
+import os
 from typing import Callable, Union
 import random 
 import numpy as np 
@@ -23,11 +24,22 @@ def import_from_str(path) -> Union[type, Callable]:
     except AttributeError as e:
         raise AttributeError(f"Class '{obj_name}' not found in module '{module_name}'.") from e
 
-def set_determinism(seed: int):
+def set_determinism(seed: int, strict: bool = False):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    if strict:
+        # This must be configured before the first cuBLAS operation. The
+        # experiment command should also export it before Python starts; the
+        # fallback keeps direct TrainConfig users safe when CUDA is still lazy.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
 
 
 from typing import List

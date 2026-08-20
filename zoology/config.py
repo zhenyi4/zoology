@@ -144,6 +144,12 @@ class TrainConfig(BaseConfig):
     optimizer_parameter_grouping: Literal["matrix_only", "uniform"] = "matrix_only"
     seed: int = 123
 
+    # A positive value enables repeatability diagnostics and stops after this
+    # many optimizer steps. Strict determinism is opt-in because third-party
+    # CUDA kernels may reject deterministic-algorithm enforcement.
+    diagnostic_steps: int = 0
+    strict_determinism: bool = False
+
     launch_id: str = None
     sweep_id: str = None
     run_id: str = "default"

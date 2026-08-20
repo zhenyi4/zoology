@@ -49,10 +49,14 @@ class WandbLogger:
         if self.no_logger:
             return
         wandb.log(metrics)
+
+    def log_summary(self, metrics: dict):
+        if self.no_logger:
+            return
+        self.run.summary.update(metrics)
     
     def finish(self):
         if self.no_logger:
             return
         self.run.finish()
-
 

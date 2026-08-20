@@ -1,4 +1,5 @@
 import argparse
+import json
 import random
 from datetime import datetime
 from typing import List, Union
@@ -18,6 +19,25 @@ from zoology.model import LanguageModel, ContinuousInputModel
 from zoology.logger import WandbLogger
 from zoology.utils import set_determinism
 from zoology.metrics import compute_mse, compute_ce_with_embeddings
+from zoology.diagnostics import (
+    model_gradients_sha256,
+    model_parameters_sha256,
+    named_tensors_sha256,
+    rng_state_sha256,
+    runtime_diagnostics,
+    tensor_sha256,
+)
+
+
+def log_diagnostics(logger: WandbLogger, diagnostics: dict):
+    """Print diagnostics and persist them as W&B summary fields."""
+    payload = {
+        f"diagnostics/{key}": value
+        for key, value in diagnostics.items()
+    }
+    print("Repeatability diagnostics:")
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    logger.log_summary(payload)
 
 
 def build_adamw_parameter_groups(
@@ -128,6 +148,7 @@ class Trainer:
         slice_keys: List[str] = [],
         device: Union[str, int] = "cuda",
         logger: WandbLogger = None,
+        diagnostic_steps: int = 0,
     ):
         self.model = model
         self.train_dataloader = train_dataloader
@@ -144,8 +165,14 @@ class Trainer:
         self.optimizer_parameter_grouping = optimizer_parameter_grouping
         self.slice_keys = slice_keys
         self.loss_type = loss_type
+        if diagnostic_steps < 0:
+            raise ValueError(
+                f"diagnostic_steps must be non-negative; got {diagnostic_steps}."
+            )
+        self.diagnostic_steps = diagnostic_steps
+        self.train_steps_completed = 0
 
-    def compute_loss(self, inputs, targets):
+    def compute_loss(self, inputs, targets, return_outputs: bool = False):
         if self.input_type == "continuous":
             
             all_embeddings = self.model.backbone.embeddings.word_embeddings.weight
@@ -170,6 +197,8 @@ class Trainer:
             
             logits = outputs_flat @ value_embeddings.T
             preds = (logits).argmax(dim=-1).view(targets.shape)
+            if return_outputs:
+                return loss, preds, logits
             return loss, preds
         
         else: # discrete
@@ -180,6 +209,8 @@ class Trainer:
                     targets.flatten()
                 )
                 preds = logits.argmax(dim=-1)
+                if return_outputs:
+                    return loss, preds, logits
                 return loss, preds
             
             elif self.loss_type == "mse":
@@ -192,6 +223,8 @@ class Trainer:
                 )
                 logits = embeddings @ self.model.backbone.embeddings.word_embeddings.weight.T
                 preds = logits.argmax(dim=-1)
+                if return_outputs:
+                    return loss, preds, logits
                 return loss, preds
             
             elif self.loss_type == "ce_embed":
@@ -205,6 +238,8 @@ class Trainer:
                 )
                 logits = embeddings @ value_embeddings.T
                 preds = logits.argmax(dim=-1)
+                if return_outputs:
+                    return loss, preds, logits
                 return loss, preds
 
     def train_epoch(self, epoch_idx: int):
@@ -216,10 +251,63 @@ class Trainer:
         )
 
         for inputs, targets, slices in iterator:
+            diagnostic_step = self.train_steps_completed < self.diagnostic_steps
+            diagnostics = {}
+            if diagnostic_step:
+                step_prefix = f"step_{self.train_steps_completed}"
+                diagnostics.update(
+                    {
+                        f"{step_prefix}/batch_inputs_sha256": tensor_sha256(
+                            inputs, name="inputs"
+                        ),
+                        f"{step_prefix}/batch_targets_sha256": tensor_sha256(
+                            targets, name="targets"
+                        ),
+                        f"{step_prefix}/batch_sha256": named_tensors_sha256(
+                            [("inputs", inputs), ("targets", targets)]
+                        ),
+                    }
+                )
             inputs, targets = inputs.to(self.device), targets.to(self.device)
             self.optimizer.zero_grad()
 
-            loss, preds = self.compute_loss(inputs, targets)
+            if diagnostic_step:
+                diagnostics[f"{step_prefix}/rng_before_forward_sha256"] = (
+                    rng_state_sha256()
+                )
+                loss, preds, model_outputs = self.compute_loss(
+                    inputs,
+                    targets,
+                    return_outputs=True,
+                )
+                outputs_to_hash = model_outputs
+                if (
+                    model_outputs.ndim == targets.ndim + 1
+                    and model_outputs.shape[:-1] == targets.shape
+                ):
+                    # Full MQAR logits can exceed 2 GB at batch size 256.
+                    # Answer-position logits are sufficient to detect the
+                    # first numerical divergence and are inexpensive to hash.
+                    outputs_to_hash = model_outputs[targets != -100]
+                diagnostics.update(
+                    {
+                        f"{step_prefix}/model_outputs_sha256": tensor_sha256(
+                            outputs_to_hash, name="supervised_model_outputs"
+                        ),
+                        f"{step_prefix}/predictions_sha256": tensor_sha256(
+                            preds, name="predictions"
+                        ),
+                        f"{step_prefix}/loss_sha256": tensor_sha256(
+                            loss, name="loss"
+                        ),
+                        f"{step_prefix}/loss_value": loss.item(),
+                        f"{step_prefix}/rng_after_forward_sha256": (
+                            rng_state_sha256()
+                        ),
+                    }
+                )
+            else:
+                loss, preds = self.compute_loss(inputs, targets)
 
             # Auxiliary losses (discrete mode only)
             if self.input_type == "discrete":
@@ -232,9 +320,38 @@ class Trainer:
                     loss = loss + sum(auxiliary_loss)
 
             loss.backward()
+            if diagnostic_step:
+                diagnostics.update(
+                    {
+                        f"{step_prefix}/gradients_sha256": (
+                            model_gradients_sha256(self.model)
+                        ),
+                        f"{step_prefix}/rng_after_backward_sha256": (
+                            rng_state_sha256()
+                        ),
+                    }
+                )
             self.optimizer.step()
+            if diagnostic_step:
+                diagnostics[f"{step_prefix}/model_post_step_sha256"] = (
+                    model_parameters_sha256(self.model)
+                )
+                log_diagnostics(self.logger, diagnostics)
+
+            self.train_steps_completed += 1
             iterator.set_postfix({"loss": loss.item()})
             self.logger.log({"train/loss": loss.item(), "epoch": epoch_idx})
+
+            if (
+                self.diagnostic_steps > 0
+                and self.train_steps_completed >= self.diagnostic_steps
+            ):
+                print(
+                    "Diagnostic step limit reached; stopping before validation "
+                    f"after {self.train_steps_completed} optimizer step(s)."
+                )
+                return True
+        return False
 
     def test(self, epoch_idx: int):
         self.model.eval()
@@ -274,6 +391,16 @@ class Trainer:
 
     def fit(self):
         self.model.to(self.device)
+        if self.diagnostic_steps > 0:
+            log_diagnostics(
+                self.logger,
+                {
+                    "model_at_fit_start_sha256": model_parameters_sha256(
+                        self.model
+                    ),
+                    "rng_at_fit_start_sha256": rng_state_sha256(),
+                },
+            )
         self.loss_fn = nn.CrossEntropyLoss()
         if self.optimizer_parameter_grouping == "matrix_only":
             optimizer_parameters, parameter_group_summary = (
@@ -321,7 +448,9 @@ class Trainer:
             self.optimizer, T_max=self.max_epochs, eta_min=0.0
         )
         for epoch_idx in range(self.max_epochs):
-            self.train_epoch(epoch_idx)
+            diagnostic_complete = self.train_epoch(epoch_idx)
+            if diagnostic_complete:
+                break
             metrics = self.test(epoch_idx)
 
             # early stopping
@@ -355,21 +484,51 @@ def compute_metrics(
 
 
 def train(config: TrainConfig):
-    set_determinism(config.seed)
+    if config.diagnostic_steps < 0:
+        raise ValueError(
+            f"diagnostic_steps must be non-negative; got {config.diagnostic_steps}."
+        )
+
+    set_determinism(config.seed, strict=config.strict_determinism)
+    setup_diagnostics = {}
+    if config.diagnostic_steps > 0:
+        setup_diagnostics["rng_after_seed_sha256"] = rng_state_sha256()
     
     logger = WandbLogger(config)
     logger.log_config(config)
     config.print()
+    if config.diagnostic_steps > 0:
+        setup_diagnostics["rng_after_wandb_init_sha256"] = rng_state_sha256()
 
     if config.input_type == "continuous":
         model = ContinuousInputModel(config.model)
+        if config.diagnostic_steps > 0:
+            setup_diagnostics["model_initial_sha256"] = (
+                model_parameters_sha256(model)
+            )
+            setup_diagnostics["rng_after_model_init_sha256"] = rng_state_sha256()
         train_dataloader, test_dataloader = prepare_continuous_data(
             config.data,
             embeddings=model.backbone.embeddings.word_embeddings.weight.detach(),
         )
     else:
         model = LanguageModel(config.model)
+        if config.diagnostic_steps > 0:
+            setup_diagnostics["model_initial_sha256"] = (
+                model_parameters_sha256(model)
+            )
+            setup_diagnostics["rng_after_model_init_sha256"] = rng_state_sha256()
         train_dataloader, test_dataloader = prepare_data(config.data)
+
+    if config.diagnostic_steps > 0:
+        setup_diagnostics["rng_after_data_prepare_sha256"] = rng_state_sha256()
+        setup_diagnostics.update(
+            {
+                f"runtime/{key}": value
+                for key, value in runtime_diagnostics().items()
+            }
+        )
+        log_diagnostics(logger, setup_diagnostics)
 
     logger.log_model(model, config=config)
 
@@ -388,6 +547,7 @@ def train(config: TrainConfig):
         loss_type=config.loss_type,
         device="cuda" if torch.cuda.is_available() else "cpu",
         logger=logger,
+        diagnostic_steps=config.diagnostic_steps,
     )
     task.fit()
     logger.finish()
