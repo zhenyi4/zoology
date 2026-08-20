@@ -141,6 +141,7 @@ class TrainConfig(BaseConfig):
 
     learning_rate: float = 1e-3
     weight_decay: float = 0.1
+    optimizer_parameter_grouping: Literal["matrix_only", "uniform"] = "matrix_only"
     seed: int = 123
 
     launch_id: str = None

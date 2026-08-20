@@ -20,6 +20,97 @@ from zoology.utils import set_determinism
 from zoology.metrics import compute_mse, compute_ce_with_embeddings
 
 
+def build_adamw_parameter_groups(
+    model: nn.Module,
+    weight_decay: float,
+):
+    """Split trainable parameters into AdamW decay and no-decay groups.
+
+    Biases, normalization/scalar/vector parameters, and parameters explicitly
+    marked with ``_no_weight_decay`` should not be regularized. The last case
+    is required by recurrent mixers such as Mamba2 and Gated DeltaNet for
+    ``A_log``, ``dt_bias``, and ``D``. Using ``parameter.ndim < 2`` also covers
+    LayerNorm/RMSNorm scale parameters without depending on a particular norm
+    implementation.
+    """
+    decay_parameters = []
+    no_decay_parameters = []
+    decay_names = []
+    no_decay_names = []
+    explicitly_excluded_names = []
+
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+
+        explicitly_excluded = getattr(parameter, "_no_weight_decay", False)
+        exclude_from_weight_decay = (
+            explicitly_excluded
+            or name.endswith(".bias")
+            or parameter.ndim < 2
+        )
+        if exclude_from_weight_decay:
+            no_decay_parameters.append(parameter)
+            no_decay_names.append(name)
+            if explicitly_excluded:
+                explicitly_excluded_names.append(name)
+        else:
+            decay_parameters.append(parameter)
+            decay_names.append(name)
+
+    grouped_parameter_ids = {
+        id(parameter)
+        for parameter in decay_parameters + no_decay_parameters
+    }
+    trainable_parameter_ids = {
+        id(parameter)
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    }
+    if grouped_parameter_ids != trainable_parameter_ids:
+        missing = len(trainable_parameter_ids - grouped_parameter_ids)
+        duplicated = (
+            len(decay_parameters)
+            + len(no_decay_parameters)
+            - len(grouped_parameter_ids)
+        )
+        raise RuntimeError(
+            "AdamW parameter grouping must cover every trainable parameter "
+            f"exactly once; missing={missing}, duplicated={duplicated}."
+        )
+
+    groups = []
+    if decay_parameters:
+        groups.append(
+            {
+                "params": decay_parameters,
+                "weight_decay": weight_decay,
+            }
+        )
+    if no_decay_parameters:
+        groups.append(
+            {
+                "params": no_decay_parameters,
+                "weight_decay": 0.0,
+            }
+        )
+
+    summary = {
+        "decay_parameter_tensors": len(decay_parameters),
+        "decay_parameter_scalars": sum(
+            parameter.numel() for parameter in decay_parameters
+        ),
+        "no_decay_parameter_tensors": len(no_decay_parameters),
+        "no_decay_parameter_scalars": sum(
+            parameter.numel() for parameter in no_decay_parameters
+        ),
+        "decay_parameter_names": decay_names,
+        "no_decay_parameter_names": no_decay_names,
+        "explicitly_excluded_parameter_names": explicitly_excluded_names,
+    }
+    return groups, summary
+
+
 class Trainer:
     def __init__(
         self,
@@ -30,6 +121,7 @@ class Trainer:
         max_epochs: int = 100,
         learning_rate: float = 1e-3,
         weight_decay: float = 0.1,
+        optimizer_parameter_grouping: str = "matrix_only",
         early_stopping_metric: str = None,
         early_stopping_threshold: float = None,
         loss_type: str = "ce",
@@ -49,6 +141,7 @@ class Trainer:
         self.early_stopping_threshold = early_stopping_threshold
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
+        self.optimizer_parameter_grouping = optimizer_parameter_grouping
         self.slice_keys = slice_keys
         self.loss_type = loss_type
 
@@ -182,10 +275,47 @@ class Trainer:
     def fit(self):
         self.model.to(self.device)
         self.loss_fn = nn.CrossEntropyLoss()
+        if self.optimizer_parameter_grouping == "matrix_only":
+            optimizer_parameters, parameter_group_summary = (
+                build_adamw_parameter_groups(
+                    self.model,
+                    weight_decay=self.weight_decay,
+                )
+            )
+            print(
+                "AdamW parameter groups: "
+                f"decay={parameter_group_summary['decay_parameter_tensors']} tensors/"
+                f"{parameter_group_summary['decay_parameter_scalars']} scalars at "
+                f"weight_decay={self.weight_decay}; "
+                f"no_decay={parameter_group_summary['no_decay_parameter_tensors']} tensors/"
+                f"{parameter_group_summary['no_decay_parameter_scalars']} scalars."
+            )
+            if parameter_group_summary["explicitly_excluded_parameter_names"]:
+                print(
+                    "Parameters explicitly marked no-weight-decay: "
+                    + ", ".join(
+                        parameter_group_summary[
+                            "explicitly_excluded_parameter_names"
+                        ]
+                    )
+                )
+            optimizer_weight_decay = 0.0
+        elif self.optimizer_parameter_grouping == "uniform":
+            optimizer_parameters = self.model.parameters()
+            optimizer_weight_decay = self.weight_decay
+            print(
+                "AdamW parameter grouping: uniform legacy mode; all trainable "
+                f"parameters use weight_decay={self.weight_decay}."
+            )
+        else:
+            raise ValueError(
+                "optimizer_parameter_grouping must be 'matrix_only' or "
+                f"'uniform'; got {self.optimizer_parameter_grouping!r}."
+            )
         self.optimizer = optim.AdamW(
-            self.model.parameters(),
+            optimizer_parameters,
             lr=self.learning_rate,
-            weight_decay=self.weight_decay,
+            weight_decay=optimizer_weight_decay,
         )
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=self.max_epochs, eta_min=0.0
@@ -251,6 +381,7 @@ def train(config: TrainConfig):
         max_epochs=config.max_epochs,
         learning_rate=config.learning_rate,
         weight_decay=config.weight_decay,
+        optimizer_parameter_grouping=config.optimizer_parameter_grouping,
         early_stopping_metric=config.early_stopping_metric,
         early_stopping_threshold=config.early_stopping_threshold,
         slice_keys=config.slice_keys,
