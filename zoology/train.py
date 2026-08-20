@@ -142,6 +142,7 @@ class Trainer:
         learning_rate: float = 1e-3,
         weight_decay: float = 0.1,
         optimizer_parameter_grouping: str = "matrix_only",
+        learning_rate_schedule: str = "cosine",
         early_stopping_metric: str = None,
         early_stopping_threshold: float = None,
         loss_type: str = "ce",
@@ -149,6 +150,8 @@ class Trainer:
         device: Union[str, int] = "cuda",
         logger: WandbLogger = None,
         diagnostic_steps: int = 0,
+        max_steps: int = 0,
+        log_train_accuracy: bool = False,
     ):
         self.model = model
         self.train_dataloader = train_dataloader
@@ -163,6 +166,7 @@ class Trainer:
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.optimizer_parameter_grouping = optimizer_parameter_grouping
+        self.learning_rate_schedule = learning_rate_schedule
         self.slice_keys = slice_keys
         self.loss_type = loss_type
         if diagnostic_steps < 0:
@@ -170,7 +174,17 @@ class Trainer:
                 f"diagnostic_steps must be non-negative; got {diagnostic_steps}."
             )
         self.diagnostic_steps = diagnostic_steps
+        if max_steps < 0:
+            raise ValueError(f"max_steps must be non-negative; got {max_steps}.")
+        if diagnostic_steps > 0 and max_steps > 0:
+            raise ValueError(
+                "diagnostic_steps and max_steps cannot both be positive."
+            )
+        self.max_steps = max_steps
+        self.log_train_accuracy = log_train_accuracy
         self.train_steps_completed = 0
+        self.peak_train_accuracy = None
+        self.peak_train_accuracy_step = None
 
     def compute_loss(self, inputs, targets, return_outputs: bool = False):
         if self.input_type == "continuous":
@@ -339,8 +353,40 @@ class Trainer:
                 log_diagnostics(self.logger, diagnostics)
 
             self.train_steps_completed += 1
-            iterator.set_postfix({"loss": loss.item()})
-            self.logger.log({"train/loss": loss.item(), "epoch": epoch_idx})
+            train_metrics = {
+                "train/loss": loss.item(),
+                "train/step": self.train_steps_completed,
+                "train/learning_rate": self.optimizer.param_groups[0]["lr"],
+                "epoch": epoch_idx,
+            }
+            if self.log_train_accuracy:
+                supervised = targets != -100
+                if supervised.any():
+                    train_accuracy = (
+                        (preds[supervised] == targets[supervised])
+                        .to(torch.float32)
+                        .mean()
+                        .item()
+                    )
+                    train_metrics["train/accuracy"] = train_accuracy
+                    if (
+                        self.peak_train_accuracy is None
+                        or train_accuracy > self.peak_train_accuracy
+                    ):
+                        self.peak_train_accuracy = train_accuracy
+                        self.peak_train_accuracy_step = self.train_steps_completed
+                    train_metrics["train/peak_accuracy"] = self.peak_train_accuracy
+            iterator.set_postfix(
+                {
+                    "loss": train_metrics["train/loss"],
+                    **(
+                        {"acc": train_metrics["train/accuracy"]}
+                        if "train/accuracy" in train_metrics
+                        else {}
+                    ),
+                }
+            )
+            self.logger.log(train_metrics)
 
             if (
                 self.diagnostic_steps > 0
@@ -350,8 +396,14 @@ class Trainer:
                     "Diagnostic step limit reached; stopping before validation "
                     f"after {self.train_steps_completed} optimizer step(s)."
                 )
-                return True
-        return False
+                return "diagnostic"
+            if self.max_steps > 0 and self.train_steps_completed >= self.max_steps:
+                print(
+                    "Training step limit reached after "
+                    f"{self.train_steps_completed} optimizer step(s)."
+                )
+                return "max_steps"
+        return None
 
     def test(self, epoch_idx: int):
         self.model.eval()
@@ -444,14 +496,28 @@ class Trainer:
             lr=self.learning_rate,
             weight_decay=optimizer_weight_decay,
         )
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=self.max_epochs, eta_min=0.0
-        )
+        if self.learning_rate_schedule == "cosine":
+            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=self.max_epochs, eta_min=0.0
+            )
+        elif self.learning_rate_schedule == "constant":
+            self.scheduler = optim.lr_scheduler.LambdaLR(
+                self.optimizer,
+                lr_lambda=lambda _: 1.0,
+            )
+        else:
+            raise ValueError(
+                "learning_rate_schedule must be 'cosine' or 'constant'; "
+                f"got {self.learning_rate_schedule!r}."
+            )
         for epoch_idx in range(self.max_epochs):
-            diagnostic_complete = self.train_epoch(epoch_idx)
-            if diagnostic_complete:
+            stop_reason = self.train_epoch(epoch_idx)
+            if stop_reason == "diagnostic":
                 break
             metrics = self.test(epoch_idx)
+
+            if stop_reason == "max_steps":
+                break
 
             # early stopping
             if (self.early_stopping_metric is not None) and metrics[
@@ -464,6 +530,15 @@ class Trainer:
                 break
 
             self.scheduler.step()
+
+        if self.peak_train_accuracy is not None:
+            self.logger.log_summary(
+                {
+                    "train/peak_accuracy": self.peak_train_accuracy,
+                    "train/peak_accuracy_step": self.peak_train_accuracy_step,
+                    "train/optimizer_steps_completed": self.train_steps_completed,
+                }
+            )
 
 
 def compute_metrics(
@@ -488,6 +563,10 @@ def train(config: TrainConfig):
         raise ValueError(
             f"diagnostic_steps must be non-negative; got {config.diagnostic_steps}."
         )
+    if config.max_steps < 0:
+        raise ValueError(f"max_steps must be non-negative; got {config.max_steps}.")
+    if config.diagnostic_steps > 0 and config.max_steps > 0:
+        raise ValueError("diagnostic_steps and max_steps cannot both be positive.")
 
     set_determinism(config.seed, strict=config.strict_determinism)
     setup_diagnostics = {}
@@ -541,6 +620,7 @@ def train(config: TrainConfig):
         learning_rate=config.learning_rate,
         weight_decay=config.weight_decay,
         optimizer_parameter_grouping=config.optimizer_parameter_grouping,
+        learning_rate_schedule=config.learning_rate_schedule,
         early_stopping_metric=config.early_stopping_metric,
         early_stopping_threshold=config.early_stopping_threshold,
         slice_keys=config.slice_keys,
@@ -548,6 +628,8 @@ def train(config: TrainConfig):
         device="cuda" if torch.cuda.is_available() else "cpu",
         logger=logger,
         diagnostic_steps=config.diagnostic_steps,
+        max_steps=config.max_steps,
+        log_train_accuracy=config.log_train_accuracy,
     )
     task.fit()
     logger.finish()

@@ -2,9 +2,10 @@
 
 This module intentionally contains no copied Gated DeltaNet equations.  FLA
 owns the projections, ShortConv, decay/gate initialization, recurrent kernel,
-normalization, and output projection.  The adapter only translates Zoology's
-``d_model`` argument, selects an optional mixed-precision context, unwraps
-FLA's tuple return value, and reports the recurrent matrix-state size.
+normalization, and output projection.  The adapter translates Zoology's
+``d_model`` argument, optionally substitutes the paper-specified sigmoid
+output-gate nonlinearity, selects a mixed-precision context, unwraps FLA's
+tuple return value, and reports the recurrent matrix-state size.
 
 Keeping this adapter separate from ``zoology.mixers.gated_delta_net`` makes it
 possible to test whether behavior comes from Zoology's copied implementation
@@ -20,6 +21,22 @@ import torch
 from torch import nn
 
 from fla.layers.gated_deltanet import GatedDeltaNet as FLAGatedDeltaNet
+from fla.modules import RMSNorm
+
+
+class _RMSNormSigmoidGate(nn.Module):
+    """Head-wise RMSNorm followed by Kimi Linear's sigmoid output gate."""
+
+    def __init__(self, hidden_size: int, eps: float) -> None:
+        super().__init__()
+        self.norm = RMSNorm(hidden_size, eps=eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        gate: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.norm(hidden_states) * torch.sigmoid(gate)
 
 
 class DirectFLAGatedDeltaNet(nn.Module):
@@ -33,6 +50,7 @@ class DirectFLAGatedDeltaNet(nn.Module):
     """
 
     _SUPPORTED_AUTOCAST_DTYPES = {"none", "bfloat16"}
+    _SUPPORTED_OUTPUT_GATE_ACTIVATIONS = {"swish", "sigmoid"}
 
     def __init__(
         self,
@@ -43,6 +61,7 @@ class DirectFLAGatedDeltaNet(nn.Module):
         expand_v: float = 2,
         mode: str = "chunk",
         use_gate: bool = True,
+        output_gate_activation: str = "swish",
         use_short_conv: bool = True,
         conv_size: int = 4,
         conv_bias: bool = False,
@@ -74,6 +93,18 @@ class DirectFLAGatedDeltaNet(nn.Module):
                 f"{sorted(self._SUPPORTED_AUTOCAST_DTYPES)}; "
                 f"got {autocast_dtype!r}."
             )
+        if output_gate_activation not in self._SUPPORTED_OUTPUT_GATE_ACTIVATIONS:
+            raise ValueError(
+                "output_gate_activation must be one of "
+                f"{sorted(self._SUPPORTED_OUTPUT_GATE_ACTIVATIONS)}; "
+                f"got {output_gate_activation!r}."
+            )
+        if not use_gate and output_gate_activation != "swish":
+            raise ValueError(
+                "output_gate_activation only applies when use_gate=True; "
+                f"got use_gate={use_gate} and "
+                f"output_gate_activation={output_gate_activation!r}."
+            )
 
         self.d_model = d_model
         self.num_heads = num_heads
@@ -86,9 +117,11 @@ class DirectFLAGatedDeltaNet(nn.Module):
                 f"the per-head value dimension; got {head_dim} * {expand_v}."
             )
         self.autocast_dtype = autocast_dtype
+        self.output_gate_activation = output_gate_activation
 
-        # Do not reproduce or modify the GDN internals here.  This direct FLA
-        # construction is the experimental control being tested.
+        # Keep the GDN projections, recurrence, and initialization in FLA. The
+        # optional output-norm substitution below changes only the gate
+        # nonlinearity when a paper-aligned control explicitly requests it.
         self.fla_layer = FLAGatedDeltaNet(
             hidden_size=d_model,
             expand_v=expand_v,
@@ -103,6 +136,16 @@ class DirectFLAGatedDeltaNet(nn.Module):
             norm_eps=norm_eps,
             **kwargs,
         )
+        if use_gate and output_gate_activation == "sigmoid":
+            # The vendored FLA snapshot exposes only its historical fused
+            # Swish gate. Kimi Linear reports adopting a sigmoid output gate
+            # across its experiments, including the GDN baseline. Replacing
+            # only o_norm leaves FLA's projections, ShortConv, recurrence,
+            # initialization, and output projection untouched.
+            self.fla_layer.o_norm = _RMSNormSigmoidGate(
+                self.head_v_dim,
+                eps=norm_eps,
+            )
 
     def _autocast_context(self, hidden_states: torch.Tensor) -> ContextManager:
         if self.autocast_dtype == "none" or hidden_states.device.type != "cuda":
@@ -130,4 +173,3 @@ class DirectFLAGatedDeltaNet(nn.Module):
         """Return recurrent matrix-state scalars per layer (batch excluded)."""
         del sequence_length
         return self.num_heads * self.head_dim * self.head_v_dim
-

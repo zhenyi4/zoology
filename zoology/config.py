@@ -1,7 +1,7 @@
 import argparse
 from datetime import datetime
 from functools import partial
-from typing import List, Tuple, Union, Literal
+from typing import List, Optional, Tuple, Union, Literal
 
 from pydantic import BaseModel
 
@@ -135,14 +135,22 @@ class TrainConfig(BaseConfig):
 
     # stop training once this metric reaches the threshold
     # set metric to None to disable early stopping
-    early_stopping_metric: str = "valid/accuracy"
+    early_stopping_metric: Optional[str] = "valid/accuracy"
     early_stopping_threshold: float = 0.99
     slice_keys: List[str] = []
 
     learning_rate: float = 1e-3
     weight_decay: float = 0.1
     optimizer_parameter_grouping: Literal["matrix_only", "uniform"] = "matrix_only"
+    learning_rate_schedule: Literal["cosine", "constant"] = "cosine"
     seed: int = 123
+
+    # A positive value caps training by optimizer steps, independently of the
+    # dataset size and batch size. This is useful for papers that disclose a
+    # step budget rather than an epoch budget. Training accuracy logging is
+    # opt-in to preserve the historical W&B schema for existing experiments.
+    max_steps: int = 0
+    log_train_accuracy: bool = False
 
     # A positive value enables repeatability diagnostics and stops after this
     # many optimizer steps. Strict determinism is opt-in because third-party
