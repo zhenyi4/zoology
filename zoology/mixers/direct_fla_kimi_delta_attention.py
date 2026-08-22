@@ -3,6 +3,9 @@
 KDA entered FLA in release v0.4.0.  The adapter deliberately contains no KDA
 equations: FLA owns the projections, per-key-dimension decay gate, ShortConv,
 delta-rule recurrence, sigmoid output gate, normalization, and initialization.
+The sole optional exception is an initialization-only diagnostic that replaces
+FLA v0.4.2's zero ``dt_bias`` with the log-uniform time-step initialization
+introduced by FLA v0.5.2.  It does not replace or modify the recurrence kernel.
 """
 
 from __future__ import annotations
@@ -17,6 +20,46 @@ from zoology.mixers.direct_fla_utils import (
     unwrap_fla_output,
     validate_autocast_dtype,
 )
+
+
+SUPPORTED_DT_BIAS_INITS = {
+    "fla_v042_zero",
+    "fla_v052_log_uniform",
+}
+
+
+def _reinitialize_dt_bias_v052_(dt_bias: nn.Parameter) -> None:
+    """Apply FLA v0.5.2's KDA ``dt_bias`` initialization in place.
+
+    ``torch.random.fork_rng`` restores the caller's RNG state on exit.  This is
+    important for a strict initialization-only ablation: sampling the corrected
+    ``dt_bias`` must not shift the initialization of later layers or parameters.
+    """
+
+    dt_min = 0.001
+    dt_max = 0.1
+    dt_init_floor = 1e-4
+    cuda_devices: list[int] = []
+    if dt_bias.is_cuda:
+        device_index = dt_bias.device.index
+        cuda_devices = [
+            torch.cuda.current_device() if device_index is None else device_index
+        ]
+
+    with torch.random.fork_rng(devices=cuda_devices, enabled=True):
+        dt = torch.exp(
+            torch.rand(
+                dt_bias.shape,
+                dtype=torch.float32,
+                device=dt_bias.device,
+            )
+            * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        inverse_softplus_dt = dt + torch.log(-torch.expm1(-dt))
+
+    with torch.no_grad():
+        dt_bias.copy_(inverse_softplus_dt.to(dtype=dt_bias.dtype))
 
 
 class DirectFLAKimiDeltaAttention(nn.Module):
@@ -37,6 +80,7 @@ class DirectFLAKimiDeltaAttention(nn.Module):
         allow_neg_eigval: bool = False,
         norm_eps: float = 1e-5,
         autocast_dtype: str = "bfloat16",
+        dt_bias_init: str = "fla_v042_zero",
         layer_idx: int | None = None,
         **kwargs,
     ) -> None:
@@ -92,6 +136,11 @@ class DirectFLAKimiDeltaAttention(nn.Module):
                 f"{head_dim * expand_v}."
             )
         validate_autocast_dtype(autocast_dtype)
+        if dt_bias_init not in SUPPORTED_DT_BIAS_INITS:
+            raise ValueError(
+                "dt_bias_init must be one of "
+                f"{sorted(SUPPORTED_DT_BIAS_INITS)}; got {dt_bias_init!r}."
+            )
 
         self.d_model = d_model
         self.num_heads = num_heads
@@ -100,6 +149,7 @@ class DirectFLAKimiDeltaAttention(nn.Module):
         self.head_v_dim = head_v_dim
         self.expand_v = expand_v
         self.autocast_dtype = autocast_dtype
+        self.dt_bias_init = dt_bias_init
 
         self.fla_layer = FLAKimiDeltaAttention(
             hidden_size=d_model,
@@ -116,6 +166,8 @@ class DirectFLAKimiDeltaAttention(nn.Module):
             layer_idx=layer_idx,
             **kwargs,
         )
+        if dt_bias_init == "fla_v052_log_uniform":
+            _reinitialize_dt_bias_v052_(self.fla_layer.dt_bias)
 
     def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
         with autocast_context(hidden_states, self.autocast_dtype):
