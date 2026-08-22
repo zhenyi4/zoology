@@ -14,29 +14,16 @@ without changing the historical baseline.
 
 from __future__ import annotations
 
-from contextlib import nullcontext
-from typing import ContextManager
-
 import torch
 from torch import nn
 
 from fla.layers.gated_deltanet import GatedDeltaNet as FLAGatedDeltaNet
-from fla.modules import RMSNorm
-
-
-class _RMSNormSigmoidGate(nn.Module):
-    """Head-wise RMSNorm followed by Kimi Linear's sigmoid output gate."""
-
-    def __init__(self, hidden_size: int, eps: float) -> None:
-        super().__init__()
-        self.norm = RMSNorm(hidden_size, eps=eps)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        gate: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.norm(hidden_states) * torch.sigmoid(gate)
+from zoology.mixers.direct_fla_utils import (
+    RMSNormSigmoidGate,
+    autocast_context,
+    unwrap_fla_output,
+    validate_autocast_dtype,
+)
 
 
 class DirectFLAGatedDeltaNet(nn.Module):
@@ -49,7 +36,6 @@ class DirectFLAGatedDeltaNet(nn.Module):
     without an adapter-owned autocast context.
     """
 
-    _SUPPORTED_AUTOCAST_DTYPES = {"none", "bfloat16"}
     _SUPPORTED_OUTPUT_GATE_ACTIVATIONS = {"swish", "sigmoid"}
 
     def __init__(
@@ -93,12 +79,7 @@ class DirectFLAGatedDeltaNet(nn.Module):
                 "compatibility with the vendored FLA GDN layer; got "
                 f"{expand_v}."
             )
-        if autocast_dtype not in self._SUPPORTED_AUTOCAST_DTYPES:
-            raise ValueError(
-                "autocast_dtype must be one of "
-                f"{sorted(self._SUPPORTED_AUTOCAST_DTYPES)}; "
-                f"got {autocast_dtype!r}."
-            )
+        validate_autocast_dtype(autocast_dtype)
         if output_gate_activation not in self._SUPPORTED_OUTPUT_GATE_ACTIVATIONS:
             raise ValueError(
                 "output_gate_activation must be one of "
@@ -146,32 +127,15 @@ class DirectFLAGatedDeltaNet(nn.Module):
             # across its experiments, including the GDN baseline. Replacing
             # only o_norm leaves FLA's projections, ShortConv, recurrence,
             # initialization, and output projection untouched.
-            self.fla_layer.o_norm = _RMSNormSigmoidGate(
+            self.fla_layer.o_norm = RMSNormSigmoidGate(
                 self.head_v_dim,
                 eps=norm_eps,
             )
 
-    def _autocast_context(self, hidden_states: torch.Tensor) -> ContextManager:
-        if self.autocast_dtype == "none" or hidden_states.device.type != "cuda":
-            return nullcontext()
-        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-
     def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
-        with self._autocast_context(hidden_states):
+        with autocast_context(hidden_states, self.autocast_dtype):
             outputs = self.fla_layer(hidden_states=hidden_states, **kwargs)
-
-        if not isinstance(outputs, tuple) or not outputs:
-            raise TypeError(
-                "FLA GatedDeltaNet was expected to return a non-empty tuple; "
-                f"got {type(outputs).__name__}."
-            )
-        mixed_hidden_states = outputs[0]
-        if not isinstance(mixed_hidden_states, torch.Tensor):
-            raise TypeError(
-                "FLA GatedDeltaNet tuple element 0 must be a Tensor; got "
-                f"{type(mixed_hidden_states).__name__}."
-            )
-        return mixed_hidden_states
+        return unwrap_fla_output(outputs, "GatedDeltaNet")
 
     def state_size(self, sequence_length: int = 2048) -> int:
         """Return recurrent matrix-state scalars per layer (batch excluded)."""
